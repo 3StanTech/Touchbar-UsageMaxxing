@@ -77,6 +77,7 @@ def project_dir() -> Path:
 
 TEST_CONFIG = None
 REFRESH_REASON = "automatic"
+REQUESTS: dict = {}  # per-provider outcome of this call's acquisition request
 CACHE_ONLY = False
 SELECTED_PROVIDER = "all"
 OPERATION_END = None
@@ -447,7 +448,7 @@ def codex_window_fields(window: dict | None) -> tuple[float | None, str | None]:
     return pct, period_end_iso(window.get("reset_at"))
 
 
-def record_fetch_error(path: Path, error: str, wait: int, started_at: float) -> None:
+def record_fetch_error(path: Path, error: str, wait: int, started_at: float, server: int = 0) -> None:
     ATTEMPT.setdefault("outcome", error)
     # The fetch lock serializes provider metadata. Error reporting must not
     # block on the cache lock that may have exhausted this acquisition's budget.
@@ -455,13 +456,25 @@ def record_fetch_error(path: Path, error: str, wait: int, started_at: float) -> 
     meta = read_json(meta_path) or {}
     current = read_json(path) or {}
     if error == "rate_limited" and path.name == "statusline-claude-weekly.json":
-        failures = min(5, max(0, int(number(meta.get("rate_limit_failures")))) + 1)
-        meta.update(recovery_state="recovering", recovery_successes=0, rate_limit_failures=failures)
-        wait = max(wait, min(900, 60 * 2 ** (failures - 1)))
+        manual = REFRESH_REASON == "manual"
+        tally_throttle(meta, manual)
+        if manual and recovering(meta):
+            # D22: a refused tap inside an episode does not raise the level or
+            # restart the long spacing; it breaks the success run and keeps the
+            # next request at least 60 s away, like the normal cadence.
+            meta["recovery_successes"] = 0
+            wait = max(wait, 60)
+        else:
+            failures = min(5, max(0, int(number(meta.get("rate_limit_failures")))) + 1)
+            meta.update(recovery_state="recovering", recovery_successes=0, rate_limit_failures=failures)
+            wait = max(wait, recovery_spacing(failures))
     deadline = max(number(current.get("retry_at")), number(meta.get("server_retry_at")), time.time() + max(1, wait))
     meta["next_attempt_at"] = max(number(meta.get("next_attempt_at")), deadline)
     meta["current_failure"] = ATTEMPT["outcome"]
-    if error == "rate_limited": meta["server_retry_at"] = deadline
+    # Only a real Retry-After > 0 is server authority. Reader-chosen spacing
+    # stays in retry_at/recovery_next_at, which a manual refresh may bypass.
+    if server > 0:
+        meta.update(server_retry_at=max(number(meta.get("server_retry_at")), time.time() + server), server_retry_basis="retry_after")
     write_cache(meta_path, meta)
     with cache_lock(path, blocking=False) as acquired:
         if not acquired: return
@@ -470,14 +483,62 @@ def record_fetch_error(path: Path, error: str, wait: int, started_at: float) -> 
         write_cache(path, current)
 
 
+def throttle_episodes(meta):
+    """Normalized tally rows: known start or a pre-tally marker, non-negative counts."""
+    rows = meta.get("throttle_episodes")
+    clean = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict): continue
+        start, end = number(r.get("started_at"), None), number(r.get("ended_at"), None)
+        if (start is None or start <= 0) and r.get("started_before_tally") is not True: continue
+        row = {"refused": max(0, int(number(r.get("refused")))), "manual_refused": max(0, int(number(r.get("manual_refused"))))}
+        if start and start > 0: row["started_at"] = start
+        if r.get("started_before_tally") is True: row["started_before_tally"] = True
+        if number(r.get("last_refused_at")) > 0: row["last_refused_at"] = number(r.get("last_refused_at"))
+        if end and end > 0:
+            row["ended_at"] = end
+            if row.get("started_at") and end >= row["started_at"]: row["duration_seconds"] = round(end - row["started_at"], 1)
+        clean.append(row)
+    return clean[-100:]
+
+
+def tally_throttle(meta, manual):
+    """Durable Claude 429 record: one row per episode, last 100 kept (D22)."""
+    rows = throttle_episodes(meta)
+    if not rows or rows[-1].get("ended_at") is not None:
+        row = {"started_at": time.time(), "refused": 0, "manual_refused": 0}
+        if recovering(meta): row["started_before_tally"] = True
+        rows.append(row)
+    row = rows[-1]
+    row["refused"] = int(number(row.get("refused"))) + 1
+    if manual: row["manual_refused"] = int(number(row.get("manual_refused"))) + 1
+    row["last_refused_at"] = time.time()
+    meta["throttle_episodes"] = rows[-100:]
+
+
+def close_throttle(meta):
+    rows = throttle_episodes(meta)
+    if not rows or rows[-1].get("ended_at") is not None:
+        # Recovery that began before the tally (or its 429 rows) ends here: record it, start unknown.
+        rows.append({"started_before_tally": True, "refused": 0, "manual_refused": 0})
+    row = rows[-1]
+    row["ended_at"] = time.time()
+    if row.get("started_at") and row["ended_at"] >= row["started_at"]:
+        row["duration_seconds"] = round(row["ended_at"] - row["started_at"], 1)
+    meta["throttle_episodes"] = rows[-100:]
+
+
 def retry_seconds(raw: str | None) -> int:
+    """Seconds the server asked to wait: 0 when absent, zero, past or unparseable."""
+    if not raw: return 0
     try:
-        return max(1, int(raw)) if raw else 60
+        seconds = float(raw)
     except (TypeError, ValueError):
         try:
-            return max(1, int(parsedate_to_datetime(raw).timestamp() - time.time()))
+            seconds = parsedate_to_datetime(raw).timestamp() - time.time()
         except (TypeError, ValueError, OverflowError):
-            return 60
+            return 0
+    return max(0, math.ceil(seconds)) if math.isfinite(seconds) else 0
 
 
 class NoTestRedirect(urllib.request.HTTPRedirectHandler):
@@ -561,7 +622,8 @@ def fetch_codex_weekly(access: str, account: str) -> dict | None:
     except urllib.error.HTTPError as exc:
         note_http(exc)
         error = {401: "sign_in_expired", 403: "access_denied", 429: "rate_limited"}.get(exc.code, "usage_unavailable")
-        record_fetch_error(path, error, retry_seconds(exc.headers.get("Retry-After")) if exc.code == 429 else 120, started_at)
+        server = retry_seconds(exc.headers.get("Retry-After") if exc.headers else None) if exc.code == 429 else 0
+        record_fetch_error(path, error, (server or 60) if exc.code == 429 else 120, started_at, server)
         exc.close()
         return None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
@@ -668,40 +730,91 @@ def normalize_recovery(meta, cached):
               or ("rate_limit_failures" in meta and meta["rate_limit_failures"] != 0))
     if not active: return meta
     level = meta.get("rate_limit_failures", 1)
-    if type(level) is not int or not 1 <= level <= 5: level = 5
+    if type(level) is not int or not 0 <= level <= 5: level = 5
     successes = meta.get("recovery_successes", 0)
-    if type(successes) is not int or not 0 <= successes <= 2: successes = 0
+    # Reachable counts stay below 7 (5 decay steps plus 2 carried from the
+    # pre-decay rule); anything larger is malformed.
+    if type(successes) is not int or not 0 <= successes <= 6: successes = 0
     meta.update(recovery_state="recovering", rate_limit_failures=level, recovery_successes=successes)
     # Reconstruct from real persisted evidence, never from each cache read's time.
     evidence = max(number(cached.get("error_at")), number(cached.get("fetched_at")))
-    spacing = max(120, min(900, 60 * 2 ** (level - 1)))
     if cached.get("error") != "rate_limited":
-        meta["recovery_next_at"] = max(number(meta.get("recovery_next_at")), evidence + spacing)
+        meta["recovery_next_at"] = max(number(meta.get("recovery_next_at")), evidence + recovery_spacing(level))
     return meta
 
 
+def recovery_spacing(level):
+    # Level 0 is still proving sustained success at the normal 60 s target.
+    return 60 if level <= 0 else min(900, 60 * 2 ** (level - 1))
+
+
 def recovery_interval(meta):
-    level = max(1, min(5, int(number(meta.get("rate_limit_failures"), 1))))
-    return max(120, min(900, 60 * 2 ** (level - 1)))
+    return recovery_spacing(max(0, min(5, int(number(meta.get("rate_limit_failures"), 1)))))
+
+
+def trusted_server_retry(meta):
+    """Rebuild a server_retry_at the pre-2026-10-17 reader wrote from its own spacing.
+
+    This reader marks real deadlines with server_retry_basis. An unmarked one is
+    legacy: keep only what the latest HTTP 429's recorded Retry-After asked for.
+    """
+    if "server_retry_at" not in meta or meta.get("server_retry_basis") == "retry_after": return meta
+    limited = [a for a in meta.get("attempts") or [] if isinstance(a, dict) and a.get("http_status") == 429]
+    if not limited: return meta
+    asked = limited[-1].get("retry_after") or {}
+    until = (number(limited[-1].get("completed_at")) + number(asked.get("seconds")) if "seconds" in asked
+             else number(asked.get("date")))
+    meta = dict(meta)
+    if until > time.time(): meta.update(server_retry_at=until, server_retry_basis="retry_after")
+    else: meta.pop("server_retry_at", None)
+    return meta
+
+
+def last_attempt_start(meta):
+    # Latest start or finish, so the floor is never shorter than 60 s after a refusal (D22).
+    history = [max(number(a.get("started_at")), number(a.get("completed_at"))) for a in meta.get("attempts") or [] if isinstance(a, dict)]
+    return max([number(meta.get("last_attempt_started_at"))] + history)
+
+
+def note_request(name, attempted, deferred_by=None, deferred_until=None):
+    REQUESTS[name] = {"reason": "cache-only" if CACHE_ONLY else REFRESH_REASON, "attempted": attempted,
+                      "deferred_by": deferred_by, "deferred_until": deferred_until}
 
 
 def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
     global OPERATION_END, ATTEMPT
     path = cache_file("statusline-" + name + "-weekly.json")
+    note_request(name, False)
     if CACHE_ONLY: return read_json(path)
     with cache_lock(path.with_name(path.name + ".fetch"), blocking=False) as acquired:
-        if not acquired: return read_json(path)
+        if not acquired:
+            note_request(name, False, "fetch_in_progress")
+            return read_json(path)
         cached = read_json(path) or {}
         meta_path = path.with_name(path.name + ".refresh.json")
-        meta = read_json(meta_path) or {}
+        meta = trusted_server_retry(read_json(meta_path) or {})
         if name == "claude": meta = normalize_recovery(meta, cached)
         now = time.time()
         interval = poll_interval(cached, meta)
         error = cached.get("error") or meta.get("current_failure")
-        hard = max(number(cached.get("retry_at")), number(meta.get("server_retry_at")), number(meta.get("recovery_next_at")))
-        if now < hard: return cached or None
-        deadline = number(meta.get("next_manual_at")) if REFRESH_REASON == "manual" and not error else provider_deadline(cached, meta, interval)
-        if now < deadline: return cached or None
+        server = number(meta.get("server_retry_at"))
+        if REFRESH_REASON == "manual":
+            # Manual honours real server backoff and, while recovering or
+            # failing, a 60 s floor since the last attempt; it bypasses the
+            # reader's own spacing. Healthy keeps the 5 s manual gate.
+            floor = (last_attempt_start(meta) + 60 if error or (name == "claude" and recovering(meta))
+                     else number(meta.get("next_manual_at")))
+            deadline = max(server, floor)
+            deferred_by = "server_retry" if server >= floor else "manual_floor"
+        else:
+            hard = max(number(cached.get("retry_at")), server, number(meta.get("recovery_next_at")))
+            deadline = max(hard, provider_deadline(cached, meta, interval))
+            deferred_by = "server_retry" if server >= deadline else None
+        if now < deadline:
+            note_request(name, False, deferred_by, deadline)
+            return cached or None
+        note_request(name, True)
+        meta["last_attempt_started_at"] = now
         meta["next_attempt_at"] = now + (30 if error else 5)
         if REFRESH_REASON == "manual": meta["next_manual_at"] = now + 5
         write_cache(meta_path, meta)
@@ -725,16 +838,22 @@ def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
             meta["next_attempt_at"] = time.time() + interval
             complete = ATTEMPT.get("complete_acquisition", False)
             if name == "claude" and recovering(meta):
+                # Each complete success steps spacing down one level
+                # (900→480→240→120→60); exit needs level 0 and 3 successes.
+                level = meta.get("rate_limit_failures", 1)
                 successes = meta.get("recovery_successes", 0) + 1 if complete else 0
-                meta["recovery_successes"] = successes
-                if successes >= 3:
+                if complete: level = max(0, level - 1)
+                meta.update(rate_limit_failures=level, recovery_successes=successes)
+                if level == 0 and successes >= 3:
                     for k in ("rate_limit_failures", "recovery_next_at", "recovery_successes", "recovery_state"): meta.pop(k, None)
+                    close_throttle(meta)
                 else:
                     meta["recovery_state"] = "recovering"
                     meta["recovery_next_at"] = time.time() + recovery_interval(meta)
                     meta["next_attempt_at"] = max(meta["next_attempt_at"], meta["recovery_next_at"])
             elif name != "claude": meta.pop("rate_limit_failures", None)
-            if number(meta.get("server_retry_at")) <= time.time(): meta.pop("server_retry_at", None)
+            if number(meta.get("server_retry_at")) <= time.time():
+                for k in ("server_retry_at", "server_retry_basis"): meta.pop(k, None)
             ATTEMPT["outcome"] = "success" if complete else "partial_response"
             if complete:
                 meta.pop("current_failure", None)
@@ -1055,7 +1174,7 @@ def choose_claude_oauth() -> tuple[dict | None, str]:
     return next(claude_candidates(), (None, ""))
 
 
-def claude_api_get(token: str) -> tuple[dict | None, int | None]:
+def claude_api_get(token: str) -> tuple[dict | None, int | None, int]:
     req = urllib.request.Request(
         CLAUDE_USAGE_URL,
         headers={
@@ -1069,17 +1188,13 @@ def claude_api_get(token: str) -> tuple[dict | None, int | None]:
         payload = request_json(req)
     except urllib.error.HTTPError as exc:
         note_http(exc)
-        retry = exc.headers.get("Retry-After") if exc.headers else None
-        if exc.code == 429:
-            result = -retry_seconds(retry)
-        else:
-            result = exc.code
+        server = retry_seconds(exc.headers.get("Retry-After") if exc.headers else None) if exc.code == 429 else 0
         exc.close()
-        return None, result
+        return None, exc.code, server
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
         ATTEMPT["outcome"] = transport_outcome(exc)
-        return None, None
-    return (payload if isinstance(payload, dict) else None), 200
+        return None, None, 0
+    return (payload if isinstance(payload, dict) else None), 200, 0
 
 
 def period_end_iso(raw) -> str | None:
@@ -1162,20 +1277,19 @@ def fetch_claude_weekly() -> dict | None:
     if oauth_expired(oauth):
         record_fetch_error(path, "sign_in_expired", 120, started_at)
         return None
-    payload, code = claude_api_get(token)
+    payload, code, server = claude_api_get(token)
     if code == 401:
         for alternate, alternate_source in candidates:
             if oauth_expired(alternate):
                 continue
             source = alternate_source
             ATTEMPT["credential_source"] = source
-            payload, code = claude_api_get(oauth_access(alternate))
+            payload, code, server = claude_api_get(oauth_access(alternate))
             if code != 401:
                 break
-    if isinstance(code, int) and (code < 0 or code in (401, 403)):
-        wait = -code if code < 0 else 120
-        error = "rate_limited" if code < 0 else ("sign_in_expired" if code == 401 else "access_denied")
-        record_fetch_error(path, error, wait, started_at)
+    if code in (401, 403, 429):
+        error = "rate_limited" if code == 429 else ("sign_in_expired" if code == 401 else "access_denied")
+        record_fetch_error(path, error, server if code == 429 else 120, started_at, server)
         return None
     snap = claude_windows_snapshot(payload or {}, trusted=True)
     if not snap:
@@ -1800,7 +1914,7 @@ def touch_card(name: str, snap: dict | None, *, weekly_when: str) -> dict:
     }
     provider = "claude" if name == "Claude" else "codex"
     path = cache_file("statusline-" + provider + "-weekly.json")
-    meta = read_json(path.with_name(path.name + ".refresh.json")) or {}
+    meta = trusted_server_retry(read_json(path.with_name(path.name + ".refresh.json")) or {})
     if provider == "claude": meta = normalize_recovery(meta, snap)
     interval = poll_interval(snap, meta)
     card["recovery_state"] = "recovering" if provider == "claude" and recovering(meta) else "normal"
@@ -1809,6 +1923,8 @@ def touch_card(name: str, snap: dict | None, *, weekly_when: str) -> dict:
     card["diagnostics"] = {k: meta[k] for k in ("current_failure", "last_failure", "attempts") if k in meta}
     card["poll_interval_seconds"] = interval
     card["next_refresh_at"] = provider_deadline(snap, meta, interval)
+    card["request"] = REQUESTS.get(provider) or {"reason": "cache-only" if CACHE_ONLY else REFRESH_REASON,
+                                                  "attempted": False, "deferred_by": None, "deferred_until": None}
     sources = set()
     for window in ("five_hour", "seven_day"):
         card[window]["fetched_at"] = snap.get(window + "_fetched_at")

@@ -133,7 +133,12 @@ private struct Provider {
     var nextRefreshAt: Date? = nil
     var recoveryState = "normal"
     var recoverySuccesses = 0
+    var requestInterval: TimeInterval = 60
     var currentFailure: String? = nil
+    var requestReason: String? = nil
+    var deferredBy: String? = nil
+    var deferredUntil: Date? = nil
+    var lastAttemptAt: Date? = nil
     var loading = false
 }
 
@@ -180,8 +185,27 @@ private func healthDescription(_ provider: Provider, now: TimeInterval) -> Strin
     }.joined(separator: "; ")
     let next = [provider.retryAt, provider.nextRefreshAt].compactMap { $0 }.max()
     let retry = next.map { "; next attempt in \(Int(max(0, $0.timeIntervalSince1970 - now)))s" } ?? "; next attempt unknown"
-    let recovery = provider.recoveryState == "recovering" ? "; stabilizing (\(provider.recoverySuccesses)/3 complete readings)" : ""
-    return "\(provider.name): \(state); \(ages)\(recovery)\(retry)"
+    let recovery = provider.recoveryState == "recovering"
+        ? "; stabilizing after throttling (requests every \(waitText(provider.requestInterval)), \(provider.recoverySuccesses) complete readings)" : ""
+    return "\(provider.name): \(state); \(ages)\(recovery)\(retry)\(deferredClause(provider, now: now))"
+}
+
+private func waitText(_ seconds: TimeInterval) -> String {
+    let value = max(0, Int(seconds.rounded(.up)))
+    return value < 60 ? "\(value)s" : (countdown(to: Double(value), now: 0) ?? "\(value)s")
+}
+
+// Reports why the latest manual Refresh did not make a request, until that gate passes.
+private func deferredClause(_ provider: Provider, now: TimeInterval) -> String {
+    guard provider.requestReason == "manual" else { return "" }
+    // Another reader process held the fetch; its result replaces this row when it lands.
+    if provider.deferredBy == "fetch_in_progress" { return "; manual refresh joined a reading already in progress" }
+    guard let until = provider.deferredUntil?.timeIntervalSince1970, until > now else { return "" }
+    switch provider.deferredBy {
+    case "server_retry": return "; manual refresh deferred: server asked to wait \(waitText(until - now))"
+    case "manual_floor": return "; manual refresh deferred: next allowed in \(waitText(until - now))"
+    default: return ""
+    }
 }
 
 private func emptyMeter() -> Meter {
@@ -239,11 +263,22 @@ private func stripGlyph(_ top: Meter, _ bottom: Meter) -> NSImage {
 private final class UsageStripView: NSView {
     var claude = Provider(name: "Claude", five: emptyMeter(), week: emptyMeter())
     var codex = Provider(name: "Codex", five: emptyMeter(), week: emptyMeter())
-    var onClick: (() -> Void)?
-    private var pulsing = false
+    var onClick: ((String) -> Void)?
+    private var lastTouchAt: TimeInterval = -1
+    // Tap feedback: a light sweep on tap, then a bottom progress line that runs
+    // until the refresh result lands (green = every provider fresh, amber = any stale).
+    private var sweepStart: TimeInterval?
+    private var progressStart: TimeInterval?
+    private var progressEnd: (at: TimeInterval, from: CGFloat, stale: Bool)?
+    private var animationTimer: Timer?
+    private static let sweepSeconds: TimeInterval = 0.35
+    private static let finishSeconds: TimeInterval = 0.25
+    private static let progressCapSeconds: TimeInterval = 20
 
     override init(frame frameRect: NSRect) {
         super.init(frame: NSRect(x: 0, y: 0, width: touchStripWidth, height: 30))
+        // Touch Bar fingers arrive as direct touches, not mouse clicks; without this the strip never saw a tap.
+        allowedTouchTypes = [.direct, .indirect]
     }
 
     required init?(coder: NSCoder) { nil }
@@ -276,24 +311,88 @@ private final class UsageStripView: NSView {
         let codexX = claudeW + gap
         layout(claude, x: 0, width: claudeW, barW: barW, fonts: fonts, now: now, draw: true)
         layout(codex, x: codexX, width: width - codexX, barW: barW, fonts: fonts, now: now, draw: true)
-        if pulsing {
-            NSColor.white.withAlphaComponent(0.12).setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        drawTapFeedback(width: width, now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func beginTapFeedback() {
+        let now = ProcessInfo.processInfo.systemUptime
+        sweepStart = now
+        progressStart = now
+        progressEnd = nil
+        startAnimating()
+    }
+
+    func finishTapFeedback(stale: Bool) {
+        guard let start = progressStart, progressEnd == nil else { return }
+        // The finish fade follows the sweep, even when the result lands first.
+        let at = max(ProcessInfo.processInfo.systemUptime, (sweepStart ?? 0) + Self.sweepSeconds)
+        progressEnd = (at, progressFraction(elapsed: at - start), stale)
+        startAnimating()
+    }
+
+    // Eases toward 85% so a slow reading still shows motion without claiming completion.
+    private func progressFraction(elapsed: TimeInterval) -> CGFloat {
+        CGFloat(0.85 * (1 - exp(-elapsed / 0.5)))
+    }
+
+    private func startAnimating() {
+        needsDisplay = true
+        guard animationTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.animationTick() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    private func animationTick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let start = sweepStart, now - start > Self.sweepSeconds { sweepStart = nil }
+        if let end = progressEnd, now - end.at > Self.finishSeconds { progressStart = nil; progressEnd = nil }
+        if let start = progressStart, progressEnd == nil, now - start > Self.progressCapSeconds { progressStart = nil }
+        needsDisplay = true
+        if sweepStart == nil && progressStart == nil {
+            animationTimer?.invalidate()
+            animationTimer = nil
+        }
+    }
+
+    private func drawTapFeedback(width: CGFloat, now: TimeInterval) {
+        if let start = sweepStart {
+            let t = min(1, max(0, (now - start) / Self.sweepSeconds))
+            let eased = CGFloat(1 - pow(1 - t, 2))
+            let band: CGFloat = 90
+            NSColor.white.withAlphaComponent(0.22).setFill()
+            NSBezierPath(roundedRect: NSRect(x: -band + eased * (width + band), y: 0, width: band, height: bounds.height), xRadius: 6, yRadius: 6).fill()
+        }
+        guard let start = progressStart else { return }
+        var fraction = progressFraction(elapsed: now - start)
+        var alpha: CGFloat = 1
+        var color = NSColor(srgbRed: 0.36, green: 0.79, blue: 0.65, alpha: 1)
+        if let end = progressEnd, now >= end.at {
+            let t = CGFloat(min(1, max(0, (now - end.at) / Self.finishSeconds)))
+            fraction = end.from + (1 - end.from) * t
+            alpha = 1 - t
+            if end.stale { color = NSColor(srgbRed: 0.94, green: 0.62, blue: 0.15, alpha: 1) }
+        }
+        color.withAlphaComponent(alpha).setFill()
+        NSRect(x: 0, y: 0, width: width * fraction, height: 2).fill()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(point) ? self : nil
     }
 
+    override func touchesBegan(with event: NSEvent) {
+        guard !event.touches(matching: .began, in: self).filter({ $0.type == .direct }).isEmpty else { return }
+        lastTouchAt = ProcessInfo.processInfo.systemUptime
+        onClick?("touch")
+    }
+
     override func mouseDown(with event: NSEvent) {
-        pulsing = true
-        needsDisplay = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.pulsing = false
-            self?.needsDisplay = true
-        }
-        onClick?()
+        // A touch may also be delivered as a synthesized click; count it once.
+        guard ProcessInfo.processInfo.systemUptime - lastTouchAt > 0.5 else { return }
+        onClick?("mouse")
     }
 
     private struct StripFonts {
@@ -523,6 +622,8 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private var lifecycleGeneration = 0
     private var cacheReady = false
     private var inFlight: Set<String> = []
+    private var tapPending: Set<String> = []
+    private var tapStale: [String] = []
     private var pending: [String: String] = [:]
     private var runningReason: [String: String] = [:]
     private var observers: [NSObjectProtocol] = []
@@ -618,6 +719,23 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                 Task { @MainActor in
                     guard let self else { return }
                     if row["wake"] as? Bool == true { self.didWake() }
+                    else if row["manual"] as? Bool == true { self.refresh(reason: "manual") }
+                    else if row["tap"] as? Bool == true { self.tapRefresh(source: "test") }
+                    else if let name = row["snapshot"] as? String, name.range(of: "^[a-z0-9-]{1,40}$", options: .regularExpression) != nil,
+                            let view = self.usageView {
+                        // Renders the strip at Touch Bar size into the test state folder.
+                        view.frame = NSRect(x: 0, y: 0, width: 621, height: 30)
+                        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                            view.cacheDisplay(in: view.bounds, to: rep)
+                            try? rep.representation(using: .png, properties: [:])?
+                                .write(to: URL(fileURLWithPath: Runtime.state).appendingPathComponent(name + ".png"))
+                        }
+                        self.event("snapshot", detail: name)
+                    }
+                    else if row["health"] as? Bool == true, let view = self.usageView {
+                        let now = Date().timeIntervalSince1970
+                        self.event("health", detail: [view.claude, view.codex].map { healthDescription($0, now: now) }.joined(separator: " | "))
+                    }
                     else if row["permission"] as? Bool == true { self.notifications.refreshPermission() }
                     else if let providers = row["providers"] as? [String], Set(providers).isSubset(of: harnessNames) { self.applyHarness(Set(providers), force: false) }
                 }
@@ -654,8 +772,8 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
 
     private func installTouchBar() {
         let usageView = UsageStripView(frame: .zero)
-        usageView.onClick = { [weak self] in
-            self?.refreshNow()
+        usageView.onClick = { [weak self] source in
+            self?.tapRefresh(source: source)
         }
         self.usageView = usageView
         let usageItem = NSCustomTouchBarItem(identifier: usageID)
@@ -713,8 +831,26 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         notifications.requestPermission()
     }
 
-    @objc private func refreshNow() {
+    // A Touch Bar tap or menu Refresh is a manual refresh with strip feedback that ends on the real result.
+    private func tapRefresh(source: String) {
+        tapPending = ["claude", "codex"]
+        tapStale = []
+        usageView?.beginTapFeedback()
+        event("tap", detail: source)
         refresh(reason: "manual")
+    }
+
+    // Green only when every provider got a fresh reading (D22); otherwise amber, naming why.
+    private func settleTap(_ provider: String, stale: String?) {
+        guard tapPending.remove(provider) != nil else { return }
+        if let stale { tapStale.append("\(provider)=\(stale)") }
+        guard tapPending.isEmpty else { return }
+        usageView?.finishTapFeedback(stale: !tapStale.isEmpty)
+        event("tap-feedback", detail: tapStale.isEmpty ? "fresh" : "stale " + tapStale.sorted().joined(separator: " "))
+    }
+
+    @objc private func refreshNow() {
+        tapRefresh(source: "menu")
     }
 
     private func desktopProviders() -> Set<String> {
@@ -784,6 +920,16 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
 
     private func applySlots(_ slots: [String: Provider]) {
         guard let view = usageView else { return }
+        var slots = slots
+        // A cache-only reload made no request; keep the latest manual deferral it would otherwise erase.
+        // An in-progress deferral ends only once this provider records a newer completed attempt.
+        for (key, previous) in [("week", view.claude), ("codex", view.codex)]
+        where slots[key]?.requestReason == "cache-only"
+            && (previous.deferredBy != "fetch_in_progress" || slots[key]?.lastAttemptAt == previous.lastAttemptAt) {
+            slots[key]?.requestReason = previous.requestReason
+            slots[key]?.deferredBy = previous.deferredBy
+            slots[key]?.deferredUntil = previous.deferredUntil
+        }
         let resets = view.show(claude: slots["week"], codex: slots["codex"])
         (stripItem?.view as? NSButton)?.image = stripGlyph(view.claude.week, view.codex.week)
         armReset(resets)
@@ -894,11 +1040,20 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                     self.applySlots(slots)
                     let key = provider == "claude" ? "week" : "codex"
                     let row = slots[key]
-                    self.event("refresh-complete", provider: provider, detail: "\(row?.error ?? "ok") source=\(row?.source ?? "cache") retry=\(row?.retryAt?.timeIntervalSince1970 ?? 0) interval=\(row?.pollInterval ?? 0) next=\(row?.nextRefreshAt?.timeIntervalSince1970 ?? 0) five=\(row?.five.pct ?? -1) week=\(row?.week.pct ?? -1)")
+                    if reason == "manual" {
+                        self.settleTap(provider, stale: row.map { $0.deferredBy ?? $0.currentFailure } ?? "no_result")
+                    }
+                    if reason == "manual", let row, let by = row.deferredBy {
+                        // A deferred manual Refresh made no request; say so instead of "ok".
+                        self.event("refresh-deferred", provider: provider, detail: "\(by) until=\(row.deferredUntil?.timeIntervalSince1970 ?? 0) next=\(row.nextRefreshAt?.timeIntervalSince1970 ?? 0)")
+                    } else {
+                        self.event("refresh-complete", provider: provider, detail: "\(row?.error ?? "ok") source=\(row?.source ?? "cache") retry=\(row?.retryAt?.timeIntervalSince1970 ?? 0) interval=\(row?.pollInterval ?? 0) next=\(row?.nextRefreshAt?.timeIntervalSince1970 ?? 0) five=\(row?.five.pct ?? -1) week=\(row?.week.pct ?? -1)")
+                    }
                 } else {
                     if provider == "claude" { self.usageView?.claude.currentFailure = "app_timeout" }
                     else { self.usageView?.codex.currentFailure = "app_timeout" }
                     self.event("refresh-timeout", provider: provider, detail: "failed/unknown; cache retained")
+                    if reason == "manual" { self.settleTap(provider, stale: "app_timeout") }
                     self.scheduleProvider(provider, row: nil); self.updateHealth()
                 }
                 if let next = self.pending.removeValue(forKey: provider) {
@@ -964,7 +1119,12 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             nextRefreshAt: snapshotDate(row["next_refresh_at"]),
             recoveryState: row["recovery_state"] as? String ?? "normal",
             recoverySuccesses: row["recovery_successes"] as? Int ?? 0,
-            currentFailure: (row["diagnostics"] as? [String: Any])?["current_failure"] as? String
+            requestInterval: (row["request_interval_seconds"] as? Double) ?? 60,
+            currentFailure: (row["diagnostics"] as? [String: Any])?["current_failure"] as? String,
+            requestReason: (row["request"] as? [String: Any])?["reason"] as? String,
+            deferredBy: (row["request"] as? [String: Any])?["deferred_by"] as? String,
+            deferredUntil: snapshotDate((row["request"] as? [String: Any])?["deferred_until"]),
+            lastAttemptAt: snapshotDate((((row["diagnostics"] as? [String: Any])?["attempts"] as? [[String: Any]])?.last)?["completed_at"])
         )
     }
 
