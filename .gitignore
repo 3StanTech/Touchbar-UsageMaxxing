@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+
+# Reader cache: usage readings and request state for this Mac
+statusline/cache/
+
+# Build outputs, including the running copy at the repository root
+*.app/
+build/
+
+# Project notes and working files
+master.md
+CHANGELOG.md
+handoffs/
+AGENTS.md
+CLAUDE.md
