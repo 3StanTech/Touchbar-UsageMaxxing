@@ -26,18 +26,27 @@ else
  READER="${READER:-${ROOT}/statusline/statusline.sh}"
  [[ -f "$READER" && -x "$READER" ]] || { print -u2 "Reader not found or not executable: ${READER}"; exit 2; }
 fi
-mkdir -p "${APP}/Contents/MacOS"
+# The launcher is nested in the app and finds the UI from its own location.
+LAUNCHER_APP="${APP}/Contents/Library/LoginItems/UsageTouchBarLauncher.app"
+mkdir -p "${APP}/Contents/MacOS" "${LAUNCHER_APP}/Contents/MacOS"
 cp "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
+cp "${ROOT}/launcher/Info.plist" "${LAUNCHER_APP}/Contents/Info.plist"
 (( TEST )) || plutil -insert UsageReaderPath -string "${READER:A}" "${APP}/Contents/Info.plist"
 if (( TEST )); then
  /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.agents.usagetouchbar.provider-verification' "${APP}/Contents/Info.plist"
  /usr/libexec/PlistBuddy -c 'Set :CFBundleName UsageVerification' "${APP}/Contents/Info.plist"
+ /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier local.agents.usagetouchbar.provider-verification.launcher' "${LAUNCHER_APP}/Contents/Info.plist"
 fi
 SDK="$(xcrun --show-sdk-path)"
 xcrun swiftc -O -parse-as-library -target arm64-apple-macosx13.0 -sdk "$SDK" \
- -framework AppKit -framework UserNotifications -F /System/Library/PrivateFrameworks -framework DFRFoundation \
+ -framework AppKit -framework UserNotifications -framework Security -F /System/Library/PrivateFrameworks -framework DFRFoundation \
  -import-objc-header "${ROOT}/TouchBarPrivate.h" "${FLAGS[@]}" \
- -o "${APP}/Contents/MacOS/UsageTouchBar" "${ROOT}/provider-ui/main.swift" "${ROOT}/provider-ui/UsageNotifications.swift"
+ -o "${APP}/Contents/MacOS/UsageTouchBar" "${ROOT}/provider-ui/main.swift" "${ROOT}/provider-ui/UsageNotifications.swift" "${ROOT}/provider-ui/Lifecycle.swift"
+xcrun swiftc -O -parse-as-library -target arm64-apple-macosx13.0 -sdk "$SDK" \
+ -framework AppKit -framework Security "${FLAGS[@]}" \
+ -o "${LAUNCHER_APP}/Contents/MacOS/UsageTouchBarLauncher" "${ROOT}/provider-ui/Lifecycle.swift" "${ROOT}/launcher/main.swift"
+# Inner bundle first, so the outer signature seals a signed launcher.
+codesign --sign - --force "$LAUNCHER_APP"
 codesign --sign - --force "$APP"
 codesign --verify --deep --strict "$APP"
 print "built ${APP}"

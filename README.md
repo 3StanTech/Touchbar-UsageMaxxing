@@ -15,7 +15,7 @@ A macOS menu-bar accessory that keeps Claude and Codex plan usage on the MacBook
 - **Tap the strip** to refresh. The Control Strip button (a two-bar glyph of both weekly windows) brings the strip back.
 - **Notifications** (optional): a banner at 90% of the 5-hour window or 98% of the weekly window, and a "monitoring delayed" banner when a provider near its limit has gone three minutes without fresh data.
 
-The strip appears automatically while a Claude or Codex desktop app, or a Claude, Codex or Grok CLI, is running and steps aside when they close. Native Touch Bar popups (brightness, volume) are left alone for ten seconds before the strip reclaims the bar.
+The strip appears automatically while a Claude or Codex desktop app, or a Claude, Codex or Grok CLI, is running and steps aside when they close. With nothing running the app stays in the menu bar but stops reading usage until work starts again (Show and Refresh still work), then reads both providers at once. Native Touch Bar popups (brightness, volume) are left alone for ten seconds before the strip reclaims the bar.
 
 ## Requirements
 
@@ -31,11 +31,11 @@ cd Touchbar-UsageMaxxing
 ./install.sh
 ```
 
-`install.sh` builds the app into `~/Applications/UsageTouchBar.app`, ad-hoc signs it, and registers a LaunchAgent (`local.agents.usagetouchbar`) so it starts at login and restarts if it exits. The app reads usage through `statusline/statusline.sh` in this folder, so keep the folder where it is; after moving it, run `./install.sh` again. `./install.sh --uninstall` removes the app and the agent.
+`install.sh` builds the app into `~/Applications/UsageTouchBar.app`, ad-hoc signs it, and registers a LaunchAgent (`local.agents.usagetouchbar`) that runs a small launcher inside the app (`Contents/Library/LoginItems/UsageTouchBarLauncher.app`) at login. The launcher watches for Claude, Codex and Grok work, opens the app when work starts, and reopens it after a crash (at most three times a minute). The app reads usage through `statusline/statusline.sh` in this folder, so keep the folder where it is; after moving it, run `./install.sh` again. `./install.sh --uninstall` removes the app and the agent.
 
-Because the agent keeps the app alive, **Quit restarts it**; use **Hide Touch Bar overlay** from the `Usage` menu instead. To get banners, click the notifications item in the same menu; if notifications were declined earlier, it opens System Settings → Notifications.
+**Quit** closes the app and keeps it closed while the sessions already open keep running, across wake and launcher restarts. A newly started desktop app or CLI session opens it again, as does opening `UsageTouchBar.app` yourself (Finder, Spotlight or `open`). To clear the strip for a moment without quitting, use **Hide Touch Bar overlay** from the `Usage` menu. To get banners, click the notifications item in the same menu; if notifications were declined earlier, it opens System Settings → Notifications.
 
-Logs: `~/Library/Logs/UsageTouchBar/events.json` (last 200 events). State: `~/Library/Application Support/UsageTouchBar/`.
+Logs: `~/Library/Logs/UsageTouchBar/events.json` (last 200 app events) and `launcher.jsonl` beside it. State: `~/Library/Application Support/UsageTouchBar/`.
 
 ## Sign-in and privacy
 
@@ -76,7 +76,7 @@ The same reader works as a statusline for Claude Code (and the Grok CLI). Under 
 ./build-provider.sh --output "$PWD/build/UsageTouchBar.app"
 ```
 
-The output path must be absolute and end in `.app`. The build records the reader's absolute path in the bundle (`--reader PATH` to use another copy), compiles `provider-ui/`, ad-hoc signs the bundle and verifies the signature.
+The output path must be absolute and end in `.app`. The build records the reader's absolute path in the bundle (`--reader PATH` to use another copy), compiles `provider-ui/` and the nested launcher from `launcher/`, ad-hoc signs the launcher and then the bundle and verifies the signature.
 
 ## Layout
 
@@ -84,6 +84,8 @@ The output path must be absolute and end in `.app`. The build records the reader
 |---|---|
 | `provider-ui/main.swift` | The app: Touch Bar strip, menu, refresh scheduling, cache watcher. |
 | `provider-ui/UsageNotifications.swift` | Limit and monitoring-gap notifications with a persistent de-duplication ledger. |
+| `provider-ui/Lifecycle.swift` | Shared by app and launcher: single-instance lock, Quit intent, launcher state files, process detection. |
+| `launcher/main.swift`, `launcher/Info.plist` | The nested launcher: detects work, opens the app, honours Quit, bounds crash recovery. |
 | `statusline/statusline.sh` | The usage reader (Python 3): provider requests, back-off, cache, terminal statusline. |
 | `install.sh`, `build-provider.sh` | Install/uninstall; the build. |
 | `Info.plist`, `TouchBarPrivate.h` | Bundle metadata; private Touch Bar API declarations. |

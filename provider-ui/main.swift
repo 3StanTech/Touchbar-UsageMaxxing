@@ -39,16 +39,10 @@ private enum Runtime {
     }
 }
 private let scriptPath = Runtime.script
-private let harnessPollSeconds: TimeInterval = 2
 // Re-presenting the system modal bar dismisses native HUD popups (brightness, volume, sliders),
 // so only reclaim the overlay after it has stayed covered for this long.
 private let reclaimGraceSeconds: TimeInterval = 10
 private let harnessNames: Set<String> = ["grok", "claude", "codex"]
-private let harnessBundles: Set<String> = [
-    "com.anthropic.claudefordesktop",
-    "com.openai.codex",
-    "com.openai.chat",
-]
 
 private func loadDFR() -> Bool {
     let path = "/System/Library/PrivateFrameworks/DFRFoundation.framework/DFRFoundation"
@@ -553,12 +547,6 @@ private final class UsageStripView: NSView {
     }
 }
 
-private func lastComponent(_ path: String) -> String {
-    URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
-        .lastPathComponent
-        .lowercased()
-}
-
 // Drain output while running, then terminate, kill if needed, and reap on timeout.
 nonisolated private func runOutput(_ executable: String, _ arguments: [String], timeout: Double) -> Data? {
     let proc = Process()
@@ -588,14 +576,13 @@ nonisolated private func runOutput(_ executable: String, _ arguments: [String], 
     return proc.terminationStatus == 0 ? data : nil
 }
 
-nonisolated private func cliProviders() -> Set<String>? {
-    guard let data = runOutput("/bin/ps", ["-axo", "comm="], timeout: 1.5) else { return nil }
-    let text = String(data: data, encoding: .utf8) ?? ""
-    return Set(text.split(whereSeparator: \.isNewline).map { lastComponent(String($0)) }.filter { harnessNames.contains($0) })
-}
-
 @MainActor
 final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
+    private let lifecycle: UIRuntime
+    private var lifecycleObserver: NSObjectProtocol?
+    #if PROVIDER_TEST
+    private var testQuitObserver: NSObjectProtocol?
+    #endif
     private var statusItem: NSStatusItem?
     private var bar: NSTouchBar?
     private var stripItem: NSCustomTouchBarItem?
@@ -608,7 +595,6 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private var observingCache = false
     private var notifications = UsageNotifications(ledgerURL: Runtime.ledger)
     private var notificationItem: NSMenuItem?
-    private var harnessTimer: Timer?
     private var visible = false
     private var autoSuppressed = false
     private var activeProviders: Set<String> = []
@@ -617,9 +603,6 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     #if PROVIDER_TEST
     private var activityTimers: [Timer] = []
     #endif
-    private var lastCLIProviders: Set<String> = []
-    private var scanInFlight = false
-    private var lifecycleGeneration = 0
     private var cacheReady = false
     private var inFlight: Set<String> = []
     private var tapPending: Set<String> = []
@@ -643,7 +626,19 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private var resetTimer: Timer?
     private var clockTimer: Timer?
     private var coveredSince: Date?
+    private var reclaimTimer: Timer?
+    private var pendingWhilePaused: Set<String> = []
     private var healthItems: [NSMenuItem] = []
+
+    init(runtime: UIRuntime) {
+        lifecycle = runtime
+        super.init()
+    }
+
+    // Idle: the launcher reports no provider work. Automatic acquisition, reset and clock timers
+    // and gap warnings pause; explicit Show and Refresh still work. Unknown activity (no launcher
+    // state yet) keeps the previous always-polling behaviour.
+    private var paused: Bool { activityKnown && activeProviders.isEmpty }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if PROVIDER_TEST
@@ -667,33 +662,66 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         #if PROVIDER_TEST
         installTestActivity()
         #endif
-        event("launch")
+        event("launch", detail: lifecycle.record.launchMode)
+        // The launcher owns detection; its state file says which providers are working.
+        lifecycleObserver = DistributedNotificationCenter.default().addObserver(
+            forName: LifecycleNotification.stateChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.consumeLifecycleState() }
+        }
+        #if PROVIDER_TEST
+        testQuitObserver = DistributedNotificationCenter.default().addObserver(
+            forName: LifecycleNotification.testQuit, object: nil, queue: .main
+        ) { _ in Task { @MainActor in NSApp.terminate(nil) } }
+        #endif
+        let center = NSWorkspace.shared.notificationCenter
+        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.didWake() }
+        })
+        observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.notifications.refreshPermission() }
+        })
+        consumeLifecycleState()
         loadCache()
         watchCache()
-        #if !PROVIDER_TEST
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
-                     NSWorkspace.didActivateApplicationNotification, NSWorkspace.didWakeNotification] {
-            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.lifecycleGeneration += 1
-                    self.applyHarness(self.desktopProviders().union(self.lastCLIProviders), force: false)
-                    self.syncHarness(force: false)
-                    if note.name == NSWorkspace.didWakeNotification { self.didWake() }
-                    if note.name == NSWorkspace.didActivateApplicationNotification { self.notifications.refreshPermission() }
-                }
-            })
+        updateClock()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quit stays quit until new provider work or a manual open; the launcher reads this intent.
+        do {
+            try lifecycle.recordQuit()
+            event("quit-intent", detail: "recorded")
+            return .terminateNow
+        } catch {
+            event("quit-intent-failed", detail: "intent could not be written")
+            #if !PROVIDER_TEST
+            let alert = NSAlert()
+            alert.messageText = "Usage Touch Bar could not record Quit"
+            alert.informativeText = "The app is still running. Try Quit again after checking its local state folder."
+            alert.alertStyle = .warning
+            alert.runModal()
+            #endif
+            return .terminateCancel
         }
-        syncHarness(force: true)
-        harnessTimer = Timer.scheduledTimer(withTimeInterval: harnessPollSeconds, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.syncHarness(force: false)
-            }
+    }
+
+    private func consumeLifecycleState() {
+        guard let state = LifecycleFiles.readState(for: lifecycle.session) else { return }
+        lifecycle.consume(state)
+        applyHarness(Set(state.activeProviders).intersection(harnessNames), force: !activityKnown)
+    }
+
+    // Countdowns, the pace tick and the stale label move with the clock, not with refreshes;
+    // while idle and hidden nothing on screen needs them.
+    private func updateClock() {
+        updateReclaim()
+        if paused && !visible {
+            clockTimer?.invalidate()
+            clockTimer = nil
+            return
         }
-        harnessTimer?.tolerance = 0.5
-        #endif
-        // Countdowns, the pace tick and the stale label move with the clock, not with refreshes.
+        guard clockTimer == nil else { return }
         clockTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.usageView?.needsDisplay = true
@@ -701,11 +729,17 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             }
         }
         clockTimer?.tolerance = 5
+        usageView?.needsDisplay = true
+        updateHealth()
     }
 
     private func didWake() {
+        consumeLifecycleState()
+        event("wake")
+        // Waking while idle never fetches; waking with work restarts the gap-warning grace.
+        guard !paused else { return }
         if !activeProviders.isEmpty { activeSince = ProcessInfo.processInfo.systemUptime }
-        event("wake"); refresh(reason: "wake"); evaluateWarnings()
+        refresh(reason: "wake"); evaluateWarnings()
     }
 
     #if PROVIDER_TEST
@@ -765,7 +799,7 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         menu.addItem(withTitle: "Show on Touch Bar", action: #selector(showBar), keyEquivalent: "s")
         menu.addItem(withTitle: "Hide Touch Bar overlay", action: #selector(hideBar), keyEquivalent: "h")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit (restarts automatically)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         statusItem = item
     }
@@ -806,10 +840,11 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         visible = true
         autoSuppressed = false
         event("present")
+        updateClock()
     }
 
     @objc private func showBar() {
-        refresh()
+        refresh(reason: "automatic", whilePaused: true)
         present()
     }
 
@@ -819,6 +854,7 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         visible = false
         autoSuppressed = true
         event("hide")
+        updateClock()
     }
 
     @objc private func enableNotifications() {
@@ -853,49 +889,53 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         tapRefresh(source: "menu")
     }
 
-    private func desktopProviders() -> Set<String> {
-        Set(NSWorkspace.shared.runningApplications.compactMap { app in
-            guard let id = app.bundleIdentifier, harnessBundles.contains(id) else { return nil }
-            if id == "com.anthropic.claudefordesktop" { return "claude" }
-            return "codex"
-        })
-    }
-
-    private func syncHarness(force: Bool) {
-        guard !scanInFlight else { return }
-        scanInFlight = true
-        let generation = lifecycleGeneration
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let cli = cliProviders()
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.scanInFlight = false
-                guard generation == self.lifecycleGeneration else { self.syncHarness(force: force); return }
-                guard let cli else { self.activityKnown = false; self.evaluateWarnings(); self.event("scan-timeout"); return }
-                self.lastCLIProviders = cli
-                self.applyHarness(cli.union(self.desktopProviders()), force: force)
-            }
-        }
-    }
-
     private func applyHarness(_ providers: Set<String>, force: Bool) {
         activityKnown = true
         let arrived = providers.subtracting(activeProviders)
         let wasActive = !activeProviders.isEmpty
-        if providers != activeProviders { event("detection", detail: providers.sorted().joined(separator: ",")) }
+        if providers != activeProviders || force { event("detection", detail: providers.sorted().joined(separator: ",")) }
         activeProviders = providers
-        if providers.isEmpty { activeSince = nil }
-        else if !wasActive { activeSince = ProcessInfo.processInfo.systemUptime; refresh(reason: "provider-start") }
+        if providers.isEmpty {
+            // Going idle: in-flight readings finish; nothing new is scheduled until work returns.
+            activeSince = nil
+            for timer in providerTimers.values { timer.invalidate() }
+            providerTimers.removeAll()
+            resetTimer?.invalidate()
+            resetTimer = nil
+            pending = pending.filter { $0.value == "manual" }
+        } else if !wasActive {
+            // Work (re)appeared: one fresh request per provider now, and three active minutes before a gap warning (D17).
+            activeSince = ProcessInfo.processInfo.systemUptime
+            refresh(reason: "provider-start")
+        }
         evaluateWarnings()
         for provider in arrived where provider != "grok" { refreshProvider(provider, reason: "provider-start") }
         if !providers.isEmpty && (!wasActive || force) && !autoSuppressed {
-            refresh()
             present()
         } else if providers.isEmpty && (wasActive || force) {
             hideOverlay()
         } else if !providers.isEmpty && visible && !autoSuppressed {
             reclaimIfCovered()
         }
+        updateClock()
+    }
+
+    // While work runs and the strip is shown, check every 2 s whether a native popup or another
+    // app has covered it; reclaimIfCovered waits out the ten-second grace before taking it back.
+    private func updateReclaim() {
+        guard bar != nil, !activeProviders.isEmpty, visible, !autoSuppressed else {
+            if reclaimTimer != nil { event("reclaim-watch", detail: "off") }
+            reclaimTimer?.invalidate()
+            reclaimTimer = nil
+            coveredSince = nil
+            return
+        }
+        guard reclaimTimer == nil else { return }
+        event("reclaim-watch", detail: "on")
+        reclaimTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reclaimIfCovered() }
+        }
+        reclaimTimer?.tolerance = 0.5
     }
 
     // Keep the overlay claimed while a harness is running, without cutting native popups short.
@@ -906,6 +946,7 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             return
         }
         let since = coveredSince ?? Date()
+        if coveredSince == nil { event("covered") }
         coveredSince = since
         guard Date().timeIntervalSince(since) >= reclaimGraceSeconds else { return }
         coveredSince = nil
@@ -916,6 +957,7 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         guard let bar else { return }
         dismissBar(bar)
         visible = false
+        updateClock()
     }
 
     private func applySlots(_ slots: [String: Provider]) {
@@ -940,6 +982,8 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
 
     private func scheduleProvider(_ name: String, row: Provider?) {
         providerTimers[name]?.invalidate()
+        providerTimers[name] = nil
+        guard !paused else { return }
         let now = Date().timeIntervalSince1970
         let due = row?.nextRefreshAt?.timeIntervalSince1970 ?? now + 60
         let timer = Timer.scheduledTimer(withTimeInterval: max(0.1, due - now), repeats: false) { [weak self] _ in
@@ -1003,16 +1047,22 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                 self.cacheReady = true
                 let queued = self.pending
                 self.pending.removeAll()
-                for provider in ["claude", "codex"] { self.refreshProvider(provider, reason: queued[provider] ?? "automatic") }
+                for provider in ["claude", "codex"] {
+                    self.refreshProvider(provider, reason: queued[provider] ?? "automatic",
+                                         whilePaused: self.pendingWhilePaused.remove(provider) != nil)
+                }
             }
         }
     }
 
-    private func refresh(reason: String = "automatic") {
-        for provider in ["claude", "codex"] { refreshProvider(provider, reason: reason) }
+    private func refresh(reason: String = "automatic", whilePaused: Bool = false) {
+        for provider in ["claude", "codex"] { refreshProvider(provider, reason: reason, whilePaused: whilePaused) }
     }
 
-    private func refreshProvider(_ provider: String, reason: String) {
+    private func refreshProvider(_ provider: String, reason: String, whilePaused: Bool = false) {
+        // Idle pauses automatic acquisition only; manual Refresh and an explicit Show still read.
+        if paused && reason != "manual" && !whilePaused { return }
+        if paused, whilePaused, !cacheReady || inFlight.contains(provider) { pendingWhilePaused.insert(provider) }
         let rank = ["automatic": 0, "wake": 1, "provider-start": 2, "manual": 3]
         if !cacheReady || inFlight.contains(provider) {
             if rank[reason, default: 0] > rank[runningReason[provider] ?? "automatic", default: 0]
@@ -1056,11 +1106,12 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                     if reason == "manual" { self.settleTap(provider, stale: "app_timeout") }
                     self.scheduleProvider(provider, row: nil); self.updateHealth()
                 }
-                if let next = self.pending.removeValue(forKey: provider) {
+                let queuedShow = self.pendingWhilePaused.remove(provider) != nil
+                if let next = self.pending.removeValue(forKey: provider) ?? (queuedShow ? "automatic" : nil) {
                     // Let the shared successful-request cooldown expire before draining
                     // a queued manual request; failures keep their stronger backoff.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5.1) { [weak self] in
-                        self?.refreshProvider(provider, reason: next)
+                        self?.refreshProvider(provider, reason: next, whilePaused: queuedShow)
                     }
                 }
             }
@@ -1078,6 +1129,7 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     private func armReset(_ stamps: [TimeInterval]) {
         resetTimer?.invalidate()
         resetTimer = nil
+        guard !paused else { return }
         let now = Date().timeIntervalSince1970
         guard let next = stamps.filter({ $0 > now && $0 - now < 6 * 3600 }).min() else { return }
         let delay = max(1, next - now + 1)
@@ -1170,9 +1222,17 @@ enum UsageTouchBarMain {
         guard !ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("USAGE_TEST_") }),
               !CommandLine.arguments.dropFirst().contains(where: { $0.hasPrefix("--notification-") || $0.hasPrefix("--monitoring-") }) else { exit(2) }
         #endif
+        // Single UI: take the instance lock before any AppKit work; a second copy exits at once.
+        let runtime: UIRuntime
+        do {
+            guard let started = try UIRuntime.start() else { return }
+            runtime = started
+        } catch {
+            exit(78)
+        }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let agent = Agent()
+        let agent = Agent(runtime: runtime)
         app.delegate = agent
         objc_setAssociatedObject(app, "agent", agent, .OBJC_ASSOCIATION_RETAIN)
         app.run()
