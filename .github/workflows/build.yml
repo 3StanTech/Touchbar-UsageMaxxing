@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app bundle (not installed)
+        run: ./build-provider.sh --output "$RUNNER_TEMP/UsageTouchBar.app"
+      - name: Compile-check the usage reader
+        run: python3 -m py_compile statusline/statusline.sh
