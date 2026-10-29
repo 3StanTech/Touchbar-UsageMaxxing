@@ -981,12 +981,22 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 
     private func scheduleProvider(_ name: String, row: Provider?) {
-        providerTimers[name]?.invalidate()
-        providerTimers[name] = nil
-        guard !paused else { return }
+        guard !paused else {
+            providerTimers[name]?.invalidate()
+            providerTimers[name] = nil
+            return
+        }
         let now = Date().timeIntervalSince1970
         let due = row?.nextRefreshAt?.timeIntervalSince1970 ?? now + 60
-        let timer = Timer.scheduledTimer(withTimeInterval: max(0.1, due - now), repeats: false) { [weak self] _ in
+        // A competing reader still owns the acquisition. Cache notifications apply its
+        // result promptly; retry modestly if it exits without publishing a new result.
+        let minimumDelay: TimeInterval = row?.deferredBy == "fetch_in_progress" ? 2 : 0.1
+        let delay = max(minimumDelay, due - now)
+        // Unrelated cache writes must not keep sliding an already-scheduled busy retry.
+        if row?.deferredBy == "fetch_in_progress", let timer = providerTimers[name], timer.isValid,
+           timer.fireDate.timeIntervalSince1970 <= now + delay { return }
+        providerTimers[name]?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             Task { @MainActor in self?.refreshProvider(name, reason: "automatic") }
         }
         timer.tolerance = 0.05
@@ -1091,7 +1101,10 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                     let key = provider == "claude" ? "week" : "codex"
                     let row = slots[key]
                     if reason == "manual" {
-                        self.settleTap(provider, stale: row.map { $0.deferredBy ?? $0.currentFailure } ?? "no_result")
+                        self.settleTap(provider, stale: row.map {
+                            $0.deferredBy ?? $0.currentFailure
+                                ?? ($0.five.isFresh && $0.week.isFresh ? nil : "retained_usage_not_fresh")
+                        } ?? "no_result")
                     }
                     if reason == "manual", let row, let by = row.deferredBy {
                         // A deferred manual Refresh made no request; say so instead of "ok".

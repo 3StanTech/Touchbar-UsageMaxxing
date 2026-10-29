@@ -406,10 +406,8 @@ def load_codex_auth() -> tuple[str, str] | None:
 
 def window_seconds(window: dict) -> int:
     raw = window.get("limit_window_seconds")
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return 0
+    seconds = number(raw, None)
+    return int(seconds) if not isinstance(raw, bool) and seconds is not None and seconds.is_integer() else 0
 
 
 def codex_windows(payload: dict) -> list[dict]:
@@ -426,18 +424,9 @@ def codex_windows(payload: dict) -> list[dict]:
 
 def split_codex_windows(payload: dict) -> tuple[dict | None, dict | None]:
     windows = codex_windows(payload)
-    if not windows:
-        return None, None
-
-    def closest(target: int) -> dict:
-        return min(windows, key=lambda window: abs(window_seconds(window) - target))
-
-    weekly = closest(604800)
-    five = closest(18000)
-    if five is weekly:
-        if abs(window_seconds(weekly) - 604800) <= abs(window_seconds(weekly) - 18000):
-            return None, weekly
-        return weekly, None
+    # The fixed display slots identify durations, not primary/secondary positions.
+    five = next((window for window in windows if window_seconds(window) == 18000), None)
+    weekly = next((window for window in windows if window_seconds(window) == 604800), None)
     return five, weekly
 
 
@@ -445,7 +434,8 @@ def codex_window_fields(window: dict | None) -> tuple[float | None, str | None]:
     if not isinstance(window, dict): return None, None
     pct = number(window.get("used_percent"), None)
     if pct is None or isinstance(window.get("used_percent"), bool) or not 0 <= pct <= 100: return None, None
-    return pct, period_end_iso(window.get("reset_at"))
+    end = period_end_iso(window.get("reset_at"))
+    return (pct, end) if end is not None else (None, None)
 
 
 def record_fetch_error(path: Path, error: str, wait: int, started_at: float, server: int = 0) -> None:
@@ -660,7 +650,7 @@ def number(raw, default=0.0):
     try:
         n = float(raw)
         return n if math.isfinite(n) else default
-    except (ValueError, TypeError): return default
+    except (ValueError, TypeError, OverflowError): return default
 
 
 def window_fresh(snap, window, interval, now=None):
@@ -1199,12 +1189,16 @@ def claude_api_get(token: str) -> tuple[dict | None, int | None, int]:
 
 def period_end_iso(raw) -> str | None:
     try:
+        if isinstance(raw, bool): return None
         if isinstance(raw, (int, float)) and math.isfinite(raw):
             val = float(raw)
             if val > 1e12: val /= 1000.0
-            return datetime.fromtimestamp(val, tz=timezone.utc).isoformat()
-        end = parse_expiry(raw)
-        return end.isoformat() if end else None
+            end = datetime.fromtimestamp(val, tz=timezone.utc)
+        else:
+            end = parse_expiry(raw)
+        # Admit only complete, still-usable windows; malformed reports must not
+        # replace a useful cache entry or its original acquisition timestamp.
+        return end.isoformat() if end is not None and end.timestamp() > time.time() else None
     except (ValueError, OverflowError, OSError):
         return None
 
@@ -1231,8 +1225,10 @@ def claude_windows_snapshot(limits: dict, *, trusted: bool = False) -> dict | No
         window = limits.get(src)
         pct = usage_window_percent(window)
         if pct is None or not isinstance(window, dict): continue
+        end = period_end_iso(window.get("resets_at") or window.get("resetsAt"))
+        if end is None: continue
         snap[pct_key] = pct
-        snap[end_key] = period_end_iso(window.get("resets_at") or window.get("resetsAt"))
+        snap[end_key] = end
         snap[src + "_fetched_at"] = now if trusted else None
         snap[src + "_observed_at"] = now
         snap[src + "_freshness_basis"] = "api_acquisition" if trusted else "unverified_native_receipt"

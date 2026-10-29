@@ -13,7 +13,12 @@ while (( $# )); do
  esac
 done
 [[ -n "$APP" && "$APP" == /* && "$APP" == *.app ]] || { print -u2 'Explicit absolute .app output required'; exit 2; }
-[[ "${APP:A}" != "${ROOT}/UsageTouchBar.app" ]] || { print -u2 'Cannot build in installed bundle'; exit 2; }
+APP="${APP:A}"
+for protected in "${ROOT}/UsageTouchBar.app" "${HOME}/Applications/UsageTouchBar.app"; do
+ protected="${protected:A}"
+ [[ "$APP" != "$protected" && "$APP" != "$protected/"* ]] \
+  || { print -u2 'Cannot build in installed bundle'; exit 2; }
+done
 FLAGS=()
 if (( TEST )); then
  WORK="${USAGE_TEST_ROOT:-}"
