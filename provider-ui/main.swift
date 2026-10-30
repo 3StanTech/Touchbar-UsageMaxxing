@@ -146,8 +146,13 @@ private func healthLabel(_ provider: Provider, now: TimeInterval) -> String? {
     if provider.loading && providerDate(provider) == nil { return "Loading" }
     switch provider.currentFailure ?? provider.fetchError ?? provider.error {
     case "access_denied": return "Access denied"
-    case "sign_in_required", "sign_in_expired": return "Reader"
-    case "rate_limited": return "Wait"
+    case "sign_in_required", "sign_in_expired": return "Sign in"
+    case "rate_limited":
+        // Whole minutes until the next attempt, rounded up to match the strip's minute redraw;
+        // plain "Wait" once that moment has passed.
+        guard let next = [provider.retryAt, provider.nextRefreshAt].compactMap({ $0 }).max()?.timeIntervalSince1970, next > now else { return "Wait" }
+        let minutes = Int(((next - now) / 60).rounded(.up))
+        return minutes < 60 ? "Wait \(minutes)m" : String(format: "Wait %dh %02dm", minutes / 60, minutes % 60)
     default: break
     }
     guard let date = providerDate(provider) else { return "↻" }
@@ -1216,14 +1221,33 @@ final class Agent: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 }
 
+#if PROVIDER_TEST
+extension Agent {
+    /// Touch Bar label and menu health line for reader cards, through the shipping parser and rules.
+    nonisolated static func runHealthLabels(input: URL, output: URL) throws {
+        let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: input)) as! [String: Any]
+        var results = [[String: Any]]()
+        for row in raw["cases"] as! [[String: Any]] {
+            guard let provider = provider(row["card"]) else { throw CocoaError(.coderInvalidValue) }
+            let now = row["now"] as! Double
+            results.append(["case": row["case"]!, "label": healthLabel(provider, now: now) ?? NSNull(),
+                            "description": healthDescription(provider, now: now)])
+        }
+        try JSONSerialization.data(withJSONObject: results, options: .prettyPrinted).write(to: output, options: .atomic)
+    }
+}
+#endif
+
 @main
 enum UsageTouchBarMain {
     static func main() {
         #if PROVIDER_TEST
         let args = CommandLine.arguments
-        if args.count == 4 && ["--notification-rules", "--monitoring-rules"].contains(args[1]) {
+        if args.count == 4 && ["--notification-rules", "--monitoring-rules", "--health-labels"].contains(args[1]) {
             do {
-                if args[1] == "--monitoring-rules" {
+                if args[1] == "--health-labels" {
+                    try Agent.runHealthLabels(input: URL(fileURLWithPath: Runtime.guarded(args[2])), output: URL(fileURLWithPath: Runtime.guarded(args[3])))
+                } else if args[1] == "--monitoring-rules" {
                     try runMonitoringRules(input: URL(fileURLWithPath: Runtime.guarded(args[2])), output: URL(fileURLWithPath: Runtime.guarded(args[3])))
                 } else {
                 try runNotificationRules(input: URL(fileURLWithPath: Runtime.guarded(args[2])), output: URL(fileURLWithPath: Runtime.guarded(args[3])))
@@ -1233,7 +1257,7 @@ enum UsageTouchBarMain {
         }
         #else
         guard !ProcessInfo.processInfo.environment.keys.contains(where: { $0.hasPrefix("USAGE_TEST_") }),
-              !CommandLine.arguments.dropFirst().contains(where: { $0.hasPrefix("--notification-") || $0.hasPrefix("--monitoring-") }) else { exit(2) }
+              !CommandLine.arguments.dropFirst().contains(where: { $0.hasPrefix("--notification-") || $0.hasPrefix("--monitoring-") || $0.hasPrefix("--health-") }) else { exit(2) }
         #endif
         // Single UI: take the instance lock before any AppKit work; a second copy exits at once.
         let runtime: UIRuntime
