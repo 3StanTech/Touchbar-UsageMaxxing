@@ -82,6 +82,8 @@ CACHE_ONLY = False
 SELECTED_PROVIDER = "all"
 OPERATION_END = None
 ATTEMPT = {}
+CALLER = "touchbar"  # "statusline" for terminal status lines (any non-slots format)
+REQUEST_LOG_MAX_BYTES = 2_000_000
 
 
 def cache_file(name: str) -> Path:
@@ -485,6 +487,8 @@ def throttle_episodes(meta):
         if start and start > 0: row["started_at"] = start
         if r.get("started_before_tally") is True: row["started_before_tally"] = True
         if number(r.get("last_refused_at")) > 0: row["last_refused_at"] = number(r.get("last_refused_at"))
+        # Rows from before the success count existed stay without one (unknown, not zero).
+        if "successes" in r: row["successes"] = max(0, int(number(r.get("successes"))))
         if end and end > 0:
             row["ended_at"] = end
             if row.get("started_at") and end >= row["started_at"]: row["duration_seconds"] = round(end - row["started_at"], 1)
@@ -496,7 +500,7 @@ def tally_throttle(meta, manual):
     """Durable Claude 429 record: one row per episode, last 100 kept (D22)."""
     rows = throttle_episodes(meta)
     if not rows or rows[-1].get("ended_at") is not None:
-        row = {"started_at": time.time(), "refused": 0, "manual_refused": 0}
+        row = {"started_at": time.time(), "refused": 0, "manual_refused": 0, "successes": 0}
         if recovering(meta): row["started_before_tally"] = True
         rows.append(row)
     row = rows[-1]
@@ -504,6 +508,15 @@ def tally_throttle(meta, manual):
     if manual: row["manual_refused"] = int(number(row.get("manual_refused"))) + 1
     row["last_refused_at"] = time.time()
     meta["throttle_episodes"] = rows[-100:]
+
+
+def count_episode_success(meta):
+    """A complete success inside an open episode: refusals alternating with
+    successes point to a shared limit rather than our own spacing."""
+    rows = throttle_episodes(meta)
+    if rows and rows[-1].get("ended_at") is None:
+        rows[-1]["successes"] = rows[-1].get("successes", 0) + 1
+        meta["throttle_episodes"] = rows[-100:]
 
 
 def close_throttle(meta):
@@ -766,6 +779,69 @@ def last_attempt_start(meta):
     return max([number(meta.get("last_attempt_started_at"))] + history)
 
 
+def log_request(name, attempted, meta=None, snap=None, deferred_by=None, deferred_until=None):
+    """Bounded, non-secret request history for diagnosing throttling (D6).
+
+    The Touch Bar logs every call (attempt or deferral), so the log also shows
+    when the strip was active and how old each reading was; terminal status
+    lines render often and log attempts only. Never tokens, accounts or bodies.
+    """
+    if CACHE_ONLY or (CALLER != "touchbar" and not attempted): return
+    try:
+        now = time.time()
+        meta, snap = meta or {}, snap or {}
+        row = {"t": round(now, 3), "caller": CALLER, "reason": REFRESH_REASON, "attempted": attempted}
+        if not attempted:
+            row["deferred_by"] = deferred_by
+            row["deferred_until"] = round(number(deferred_until), 3) if deferred_until else None
+        else:
+            asked = ATTEMPT.get("retry_after") or {}
+            retry = (number(asked.get("seconds"), None) if "seconds" in asked
+                     else number(asked.get("date")) - number(ATTEMPT.get("completed_at"), now) if "date" in asked else None)
+            row.update(outcome=ATTEMPT.get("outcome"), http_status=ATTEMPT.get("http_status"),
+                       credential_source=ATTEMPT.get("credential_source"),
+                       retry_after_s=round(retry, 1) if retry is not None else None,
+                       elapsed_s=round(number(ATTEMPT.get("elapsed_seconds")), 2),
+                       # When the Touch Bar calls next: explains quiet stretches during backoff.
+                       next_attempt_at=round(number(ATTEMPT.get("next_attempt_at")), 3) or None)
+            if name == "claude" and TEST_CONFIG is None:
+                row["desktop_code_running"] = bool(desktop_code_pids())
+        if name == "claude":
+            row["level"] = int(number(meta.get("rate_limit_failures")))
+            row["recovery_state"] = "recovering" if recovering(meta) else "normal"
+        server = number(meta.get("server_retry_at"))
+        row["server_retry_until"] = round(server, 3) if server > now else None
+        for window, _, _ in WINDOW_FIELDS:
+            fetched = number(snap.get(window + "_fetched_at"))
+            row[window + "_age_s"] = (round(now - fetched, 1) if snap.get(window + "_freshness_basis") == "api_acquisition"
+                                      and 0 < fetched <= now else None)
+        path = cache_file("statusline-" + name + "-requests.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Appends share the rotation lock and rotation takes it exclusively, so no
+        # writer holds a descriptor to a file being renamed or replaced.
+        lock = os.open(str(path) + ".rotate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (json.dumps(row, separators=(",", ":")) + "\n").encode())  # one small append per call
+            finally:
+                os.close(fd)
+            limit = int(number((TEST_CONFIG or {}).get("request_log_max_bytes"), REQUEST_LOG_MAX_BYTES))
+            if path.stat().st_size > limit:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return  # another writer is busy; a later call rotates
+                if path.stat().st_size > limit:
+                    os.replace(path, path.with_name(path.name + ".1"))  # keep one older file
+        finally:
+            os.close(lock)
+    except Exception:
+        pass  # diagnostics never fail a reading
+
+
 def note_request(name, attempted, deferred_by=None, deferred_until=None):
     REQUESTS[name] = {"reason": "cache-only" if CACHE_ONLY else REFRESH_REASON, "attempted": attempted,
                       "deferred_by": deferred_by, "deferred_until": deferred_until}
@@ -779,7 +855,9 @@ def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
     with cache_lock(path.with_name(path.name + ".fetch"), blocking=False) as acquired:
         if not acquired:
             note_request(name, False, "fetch_in_progress")
-            return read_json(path)
+            cached = read_json(path)
+            log_request(name, False, read_json(path.with_name(path.name + ".refresh.json")), cached, "fetch_in_progress")
+            return cached
         cached = read_json(path) or {}
         meta_path = path.with_name(path.name + ".refresh.json")
         meta = trusted_server_retry(read_json(meta_path) or {})
@@ -802,6 +880,7 @@ def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
             deferred_by = "server_retry" if server >= deadline else None
         if now < deadline:
             note_request(name, False, deferred_by, deadline)
+            log_request(name, False, meta, cached, deferred_by, deadline)
             return cached or None
         note_request(name, True)
         meta["last_attempt_started_at"] = now
@@ -832,7 +911,9 @@ def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
                 # (900→480→240→120→60); exit needs level 0 and 3 successes.
                 level = meta.get("rate_limit_failures", 1)
                 successes = meta.get("recovery_successes", 0) + 1 if complete else 0
-                if complete: level = max(0, level - 1)
+                if complete:
+                    level = max(0, level - 1)
+                    count_episode_success(meta)
                 meta.update(rate_limit_failures=level, recovery_successes=successes)
                 if level == 0 and successes >= 3:
                     for k in ("rate_limit_failures", "recovery_next_at", "recovery_successes", "recovery_state"): meta.pop(k, None)
@@ -865,6 +946,7 @@ def provider_snapshot(name: str, fetch, *, force: bool = False) -> dict | None:
         history = meta.get("attempts")
         meta["attempts"] = (history if isinstance(history, list) else [])[-19:] + [ATTEMPT]
         write_cache(meta_path, meta)
+        log_request(name, True, meta, current)
         return current or None
 
 def codex_weekly_snapshot(home: Path, trigger: str) -> dict | None:
@@ -921,6 +1003,24 @@ def claude_keychain_blob() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def desktop_code_pids() -> list[int]:
+    """This user's processes running desktop Claude's bundled Claude Code."""
+    prefix = str(Path.home() / "Library/Application Support/Claude/claude-code") + "/"
+    try:
+        rows = subprocess.check_output(
+            ["/bin/ps", "-axo", "pid=,uid=,comm="], text=True,
+            stderr=subprocess.DEVNULL, timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for row in rows.splitlines():
+        fields = row.strip().split(None, 2)
+        if len(fields) == 3 and fields[1] == str(os.getuid()) and fields[2].startswith(prefix) and fields[0].isdigit():
+            pids.append(int(fields[0]))
+    return pids
+
+
 def claude_desktop_oauth() -> list[dict]:
     """Read the running desktop session's token in memory; never save or renew it.
 
@@ -929,18 +1029,8 @@ def claude_desktop_oauth() -> list[dict]:
     bundled Claude processes, and never expose environment text or tokens.
     """
     found = []
-    prefix = str(Path.home() / "Library/Application Support/Claude/claude-code") + "/"
     try:
-        rows = subprocess.check_output(
-            ["/bin/ps", "-axo", "pid=,uid=,comm="], text=True,
-            stderr=subprocess.DEVNULL, timeout=1,
-        )
-        pids = []
-        for row in rows.splitlines():
-            fields = row.strip().split(None, 2)
-            if len(fields) == 3 and fields[1] == str(os.getuid()) and fields[2].startswith(prefix):
-                pids.append(int(fields[0]))
-        for pid in sorted(pids, reverse=True)[:4]:
+        for pid in sorted(desktop_code_pids(), reverse=True)[:4]:
             try:
                 env = subprocess.check_output(
                     ["/bin/ps", "eww", "-p", str(pid), "-o", "command="],
@@ -2022,8 +2112,17 @@ def render_compact(payload: dict, home: Path, trigger: str, fmt: str, slot: str)
     print(sep.join(ansi_wrap(item[1], item[2]) for item in items))
 
 
+def caller_for(fmt: str) -> str:
+    """The Touch Bar reads `--format slots`; every other format is a terminal status line."""
+    return "touchbar" if fmt == "slots" else "statusline"
+
+
 def main() -> None:
+    global CALLER
     fmt, slot = parse_cli(configure_refresh(sys.argv[1:]))
+    CALLER = caller_for(fmt)
+    if TEST_CONFIG is not None and TEST_CONFIG.get("caller") in ("touchbar", "statusline"):
+        CALLER = TEST_CONFIG["caller"]  # test mode needs --format slots; this stands in for a terminal caller
     if fmt != "slots" and any(arg.split("=", 1)[0] in ("--provider", "--cache-only", "--refresh-reason", "--test-config") for arg in sys.argv[1:]):
         raise SystemExit("Provider/cache/test options require --format slots")
     payload = load_stdin()
