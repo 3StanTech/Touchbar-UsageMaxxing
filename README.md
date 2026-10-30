@@ -2,20 +2,18 @@
 
 A macOS menu-bar accessory that keeps Claude and Codex plan usage on the MacBook Pro Touch Bar: the 5-hour and weekly windows for both providers, side by side, always one glance away.
 
-```
-■ Claude ▮▮▯▯▯ 44% 2h 41m   ━━━━━━|━━━ 23%      ■ Codex ▮▮▯▯▯ 39% 3h 12m   ━━━━━━━━|━ 83% Wed 11:38am
-```
+![The Touch Bar strip: Claude at 51% of its 5-hour window (51m left) and 30% weekly; Codex at 27% (1h 10m left) and 17% weekly, resetting Wed 4:22pm](docs/touchbar-strip.png)
 
 ## What it shows
 
 - **5-hour window:** five thin segments (20% each), percent, and time until reset.
 - **Weekly window:** a pill with a white **pace tick** marking how much of the week has passed. Fill past the tick means you are spending faster than the week.
 - **Colors** come from the reader: green under 50%, yellow 50–79%, red 80% and over. At 100% the meter is replaced by `Limit` and the reset time.
-- **Honest freshness:** a provider dims and shows `↻ 12m` when its data is stale, `Wait` when the usage endpoint is throttled, `Reader` when the reader's sign-in is unavailable. Cached values and their real ages are kept; one provider failing never dims the other.
+- **Honest freshness:** a provider dims and shows `↻ 12m` when its data is stale, `Wait 4m` when the usage endpoint is throttled (counting down to the next attempt), `Sign in` when the reader's sign-in is unavailable. Cached values and their real ages are kept; one provider failing never dims the other.
 - **Tap the strip** to refresh. The Control Strip button (a two-bar glyph of both weekly windows) brings the strip back.
 - **Notifications** (optional): a banner at 90% of the 5-hour window or 98% of the weekly window, and a "monitoring delayed" banner when a provider near its limit has gone three minutes without fresh data.
 
-The strip appears automatically while a Claude or Codex desktop app, or a Claude, Codex or Grok CLI, is running and steps aside when they close. With nothing running the app stays in the menu bar but stops reading usage until work starts again (Show and Refresh still work), then reads both providers at once. Native Touch Bar popups (brightness, volume) are left alone for ten seconds before the strip reclaims the bar.
+The strip appears automatically while a Claude or Codex desktop app, or a Claude, Codex or Grok CLI, is running and steps aside when they close. With nothing running the app stays in the menu bar but stops reading usage until work starts again (Show and Refresh still work), then reads both providers at once. After a native Touch Bar popup (brightness, volume) the strip does not come back by itself; tap the Control Strip button or choose Show in the menu.
 
 ## Requirements
 
@@ -47,9 +45,11 @@ The reader (`statusline/statusline.sh`) asks each provider's own usage endpoint 
 
 The Touch Bar's requests go only to `api.anthropic.com`, `platform.claude.com` (renewal) and `chatgpt.com`; used as a Grok CLI statusline, the reader also asks `cli-chat-proxy.grok.com` (billing credits) and `grok.com/rest/subscriptions` (plan details) with the Grok sign-in. Tokens are never printed or logged. Reset times are shown in the Mac's time zone.
 
+For diagnosing throttling, the reader keeps a small request log per provider in `statusline/cache/` (`statusline-<provider>-requests.jsonl`, at most about 4 MB each, oldest half dropped): the time, caller (Touch Bar or terminal), result, HTTP status, which kind of sign-in was used and the reading's age. It holds no tokens, account IDs or response bodies and never leaves the Mac.
+
 ### Claude sign-in renewal (opt-in)
 
-By default the reader only reads your Claude sign-in. If the terminal sign-in has expired and no valid token is available, the Claude side shows `Reader` and the reader reports `sign_in_expired` until Claude Code refreshes it. To let the reader renew it instead, create the switch file:
+By default the reader only reads your Claude sign-in. If the terminal sign-in has expired and no valid token is available, the Claude side shows `Sign in` and the reader reports `sign_in_expired` until Claude Code refreshes it. To let the reader renew it instead, create the switch file:
 
 ```bash
 mkdir -p ~/Library/Application\ Support/UsageTouchBar
@@ -77,6 +77,14 @@ The same reader works as a statusline for Claude Code (and the Grok CLI). Under 
 ```
 
 The output path must be absolute and end in `.app`. The build records the reader's absolute path in the bundle (`--reader PATH` to use another copy), compiles `provider-ui/` and the nested launcher from `launcher/`, ad-hoc signs the launcher and then the bundle and verifies the signature.
+
+## Tests
+
+```bash
+tests/run_all.sh
+```
+
+Runs the reader and app behaviour tests against a copy of the reader and a separately identified verification build, using synthetic data served on 127.0.0.1. No sign-ins or network access are needed; macOS with the Xcode Command Line Tools is. CI runs the same script on every push and pull request.
 
 ## Layout
 
